@@ -4,15 +4,12 @@ import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.document.Item;
 import com.amazonaws.services.dynamodbv2.document.ItemUtils;
-import com.amazonaws.services.dynamodbv2.model.AttributeValue;
 import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
 import com.amazonaws.services.dynamodbv2.model.PutItemResult;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
-import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.syndicate.deployment.annotations.environment.EnvironmentVariable;
 import com.syndicate.deployment.annotations.environment.EnvironmentVariables;
@@ -23,7 +20,6 @@ import com.syndicate.deployment.model.ResourceType;
 import com.syndicate.deployment.model.RetentionSetting;
 import com.syndicate.deployment.model.lambda.url.AuthType;
 import com.syndicate.deployment.model.lambda.url.InvokeMode;
-
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -43,10 +39,12 @@ import java.util.UUID;
 		invokeMode = InvokeMode.BUFFERED
 )
 @DependsOn(name = "Events", resourceType = ResourceType.DYNAMODB_TABLE)
-@EnvironmentVariables(value = {
+@EnvironmentVariables({
 		@EnvironmentVariable(key = "region", value = "${region}"),
-		@EnvironmentVariable(key = "table", value = "${target_table}")})
+		@EnvironmentVariable(key = "table", value = "${target_table}")
+})
 public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPResponse> {
+
 	private static final ObjectMapper objectMapper = new ObjectMapper();
 	private static final AmazonDynamoDB dynamoDB = AmazonDynamoDBClientBuilder.defaultClient();
 
@@ -54,57 +52,38 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 	public APIGatewayV2HTTPResponse handleRequest(Object event, Context context) {
 		LambdaLogger logger = context.getLogger();
 		try {
-			logger.log("Received event: " + event.toString());
-			logger.log("EVENT: " + objectMapper.writeValueAsString(event));
-			logger.log("EVENT TYPE: " + event.getClass());
+			logger.log("Received event: " + objectMapper.writeValueAsString(event));
 
-			Map<String, Object> input = objectMapper.readValue(objectMapper.writeValueAsString(event), LinkedHashMap.class);
+			Map<String, Object> requestData = objectMapper.readValue(objectMapper.writeValueAsString(event), LinkedHashMap.class);
 
-
-			logger.log("Extracting body...");
-			String bodyString = (String) input.get("body");
-			if (bodyString == null) {
-				throw new IllegalArgumentException("Missing request body");
-			}
-			logger.log("Body string: " + bodyString);
-
-			Map<String, Object> body = objectMapper.readValue(bodyString, LinkedHashMap.class);
-			logger.log("Parsed body: " + body);
-
-			logger.log("Extracting principalId...");
-			Object principalIdObject = body.get("principalId");
-			if (principalIdObject == null) {
-				throw new IllegalArgumentException("Missing required field: principalId");
+			if (!requestData.containsKey("body")) {
+				throw new IllegalArgumentException("Request body is missing");
 			}
 
-			Integer principalId = (principalIdObject instanceof Number)
-					? ((Number) principalIdObject).intValue()
-					: Integer.parseInt(principalIdObject.toString());
-			logger.log("Extracted principalId: " + principalId);
+			Map<String, Object> body = objectMapper.readValue((String) requestData.get("body"), LinkedHashMap.class);
 
-
-			logger.log("Extracting content...");
-			Object contentObject = body.get("content");
-			if (contentObject == null) {
-				throw new IllegalArgumentException("Missing required field: content");
+			if (!body.containsKey("principalId") || !body.containsKey("content")) {
+				throw new IllegalArgumentException("Required fields are missing in request body");
 			}
-			Map<String, String> content = objectMapper.convertValue(contentObject, Map.class);
-			logger.log("Extracted content: " + content);
+
+			int principalId = Integer.parseInt(body.get("principalId").toString());
+			Map<String, String> content = objectMapper.convertValue(body.get("content"), Map.class);
 
 			String eventId = UUID.randomUUID().toString();
 			String createdAt = Instant.now().toString();
 
+			Item item = new Item()
+					.withString("id", eventId)
+					.withInt("principalId", principalId)
+					.withString("createdAt", createdAt)
+					.withMap("body", content);
 
-			Item item = new Item();
-			item.withString("id", eventId);
-			item.withInt("principalId", principalId);
-			item.withString("createdAt", createdAt);
-			item.withMap("body", content);
+			PutItemRequest putRequest = new PutItemRequest()
+					.withTableName(System.getenv("table"))
+					.withItem(ItemUtils.toAttributeValues(item));
 
-			PutItemRequest putItemRequest = new PutItemRequest().withTableName(System.getenv("table")).withItem(ItemUtils.toAttributeValues(item));
-			PutItemResult putItemResult = dynamoDB.putItem(putItemRequest);
-
-			logger.log("putItemResult:" + putItemResult.toString());
+			PutItemResult putResult = dynamoDB.putItem(putRequest);
+			logger.log("DynamoDB PutItem Result: " + putResult);
 
 			Map<String, Object> responseBody = new HashMap<>();
 			responseBody.put("id", eventId);
@@ -112,29 +91,21 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 			responseBody.put("createdAt", createdAt);
 			responseBody.put("body", content);
 
-			APIGatewayV2HTTPResponse response = new APIGatewayV2HTTPResponse();
-			response.setIsBase64Encoded(false);
-			response.setStatusCode(201);
-			response.setHeaders(Map.of("Content-Type", "application/json"));
-
-
-			Map<String, Object> responseMap = new HashMap<>();
-			responseMap.put("statusCode", 201);
-			responseMap.put("event", responseBody);
-
-			response.setBody(objectMapper.writeValueAsString(responseMap));
-
-			return response;
-
-
-		} catch (Exception e) {
-			logger.log("Error in processing request: " + e.getMessage());
 			return APIGatewayV2HTTPResponse.builder()
-					.withStatusCode(500)
-					.withBody("{\"message\": \"Internal server error\"}")
+					.withStatusCode(201)
 					.withHeaders(Map.of("Content-Type", "application/json"))
+					.withBody(objectMapper.writeValueAsString(Map.of("statusCode", 201, "event", responseBody)))
+					.withIsBase64Encoded(false)
 					.build();
 
+		} catch (Exception e) {
+			logger.log("Error encountered: " + e.getMessage());
+			return APIGatewayV2HTTPResponse.builder()
+					.withStatusCode(500)
+					.withHeaders(Map.of("Content-Type", "application/json"))
+					.withBody("{\"message\": \"Internal server error\"}")
+					.withIsBase64Encoded(false)
+					.build();
 		}
 	}
 }
