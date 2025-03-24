@@ -52,19 +52,23 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 		try {
 			logger.log("Processing request: " + objectMapper.writeValueAsString(input));
 
-			Map<String, Object> requestData = parseRequestBody(input, logger);
+			// 1️⃣ Парсимо запит
+			Map<String, Object> requestData = parseRequestBody(input);
 
 			int principalId = extractPrincipalId(requestData);
 			Map<String, String> content = extractContent(requestData);
 
+			// 2️⃣ Генеруємо ідентифікатор та час
 			String eventId = UUID.randomUUID().toString();
 			String createdAt = Instant.now().toString();
 
+			// 3️⃣ Записуємо подію в DynamoDB
 			storeEvent(eventId, principalId, createdAt, content, logger);
 
+			// 4️⃣ Формуємо відповідь
 			Map<String, Object> responseData = buildResponseData(eventId, principalId, createdAt, content);
 
-			return buildSuccessResponse(responseData);
+			return buildSuccessResponse(responseData, logger);
 
 		} catch (Exception e) {
 			logger.log("Error encountered: " + e.getMessage());
@@ -72,7 +76,7 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 		}
 	}
 
-	private Map<String, Object> parseRequestBody(Object input, LambdaLogger logger) throws Exception {
+	private Map<String, Object> parseRequestBody(Object input) throws Exception {
 		return objectMapper.readValue(objectMapper.writeValueAsString(input), HashMap.class);
 	}
 
@@ -95,6 +99,11 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 	}
 
 	private void storeEvent(String eventId, int principalId, String createdAt, Map<String, String> content, LambdaLogger logger) {
+		String tableName = System.getenv("table");
+		if (tableName == null) {
+			throw new RuntimeException("Environment variable 'table' is not set");
+		}
+
 		Item eventItem = new Item()
 				.withString("id", eventId)
 				.withInt("principalId", principalId)
@@ -102,11 +111,11 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 				.withMap("body", content);
 
 		PutItemRequest putRequest = new PutItemRequest()
-				.withTableName(System.getenv("table"))
+				.withTableName(tableName)
 				.withItem(ItemUtils.toAttributeValues(eventItem));
 
 		PutItemResult putResult = dynamoDB.putItem(putRequest);
-		logger.log("Event stored in DynamoDB: " + putResult.toString());
+		logger.log("DynamoDB PutItem Result: " + putResult.toString());
 	}
 
 	private Map<String, Object> buildResponseData(String eventId, int principalId, String createdAt, Map<String, String> content) {
@@ -118,11 +127,14 @@ public class ApiHandler implements RequestHandler<Object, APIGatewayV2HTTPRespon
 		return responseData;
 	}
 
-	private APIGatewayV2HTTPResponse buildSuccessResponse(Map<String, Object> responseData) throws Exception {
+	private APIGatewayV2HTTPResponse buildSuccessResponse(Map<String, Object> responseData, LambdaLogger logger) throws Exception {
+		String responseBody = objectMapper.writeValueAsString(Map.of("statusCode", 201, "event", responseData));
+		logger.log("Response Body: " + responseBody);
+
 		return APIGatewayV2HTTPResponse.builder()
 				.withStatusCode(201)
 				.withHeaders(Map.of("Content-Type", "application/json"))
-				.withBody(objectMapper.writeValueAsString(Map.of("statusCode", 201, "event", responseData)))
+				.withBody(responseBody)
 				.withIsBase64Encoded(false)
 				.build();
 	}
